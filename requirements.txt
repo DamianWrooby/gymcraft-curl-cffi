@@ -4,3 +4,4 @@ garminconnect>=0.3.2,<0.4.0
 curl_cffi>=0.7.0
 ua_generator>=1.0
 gunicorn==23.0.0
+python-dotenv==1.2.2
