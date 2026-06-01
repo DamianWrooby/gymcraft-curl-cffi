@@ -8,12 +8,15 @@ from datetime import date
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+from dotenv import load_dotenv
+
 from garmin_service import get_activity_detail, get_client
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY")
+load_dotenv()
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 
 app = Flask(__name__)
 CORS(
