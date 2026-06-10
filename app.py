@@ -10,6 +10,8 @@ from flask_cors import CORS
 
 from dotenv import load_dotenv
 
+from garminconnect import GarminConnectTooManyRequestsError
+
 from garmin_service import get_activity_detail, get_client
 
 logging.basicConfig(level=logging.DEBUG)
@@ -85,12 +87,23 @@ def activities():
     if not start_date:
         return jsonify({"status": "error", "message": "startDate is required"}), 400
 
+    logger.info(
+        "activities: %s..%s type=%s password_provided=%s", start_date, end_date, activity_type, bool(password)
+    )
     try:
         client = get_client(username, password)
         activities_data = client.get_activities_by_date(start_date, end_date, activity_type)
+        count = len(activities_data) if activities_data else 0
+        logger.info("activities: returned %d items", count)
         return jsonify({"status": "success", "data": activities_data})
+    except GarminConnectTooManyRequestsError as e:
+        # Surface rate limits as a real 429 (not a generic 500) so the proxy/app can tell
+        # a Garmin throttle apart from other failures. If the proxy still logs a 429 whose
+        # body does NOT match this JSON, the throttle came from an intermediary, not Garmin.
+        logger.warning("activities: Garmin rate limit (429): %s", e)
+        return jsonify({"status": "error", "message": f"Garmin rate limit: {e}"}), 429
     except Exception as e:
-        logger.exception("activities failed")
+        logger.exception("activities failed (%s)", type(e).__name__)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

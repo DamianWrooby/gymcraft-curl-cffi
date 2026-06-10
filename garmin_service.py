@@ -33,31 +33,43 @@ def get_client(username: str, password: str | None = None) -> Garmin:
 
     cached = _client_cache.get(uhash)
     if cached is not None:
+        logger.info("get_client[%s]: in-memory cache hit (no Garmin login)", uhash)
         return cached
 
     user_token_dir = str(TOKEN_DIR / uhash)
+    token_exists = Path(user_token_dir).exists()
+    logger.info(
+        "get_client[%s]: cache miss; token_dir=%s exists=%s", uhash, user_token_dir, token_exists
+    )
 
     try:
         client = Garmin(email=username)
         client.login(tokenstore=user_token_dir)
         _client_cache[uhash] = client
+        logger.info("get_client[%s]: token-based login OK", uhash)
         return client
     except GarminConnectTooManyRequestsError:
         # Do not fall back to password on rate limit; bubble up immediately.
+        logger.warning("get_client[%s]: rate limited (429) during token login", uhash)
         raise
     except Exception as e:
         # Covers GarminConnectAuthenticationError, GarminConnectConnectionError,
         # and FileNotFoundError / OSError when the token dir does not exist yet
         # (first-time users). All of these should fall through to the
         # password-required path so the frontend can prompt for credentials.
-        logger.warning("Token-based login failed: %s", e)
+        logger.warning("get_client[%s]: token login failed (%s): %s", uhash, type(e).__name__, e)
 
     if not password:
+        logger.info("get_client[%s]: no token and no password -> No valid token found", uhash)
         raise ValueError("No valid token found, and password is required.")
 
+    # Cold password login: the most rate-limit-prone path. Frequent hits here in prod
+    # indicate the persisted token store is not surviving (e.g. Render cold starts).
+    logger.warning("get_client[%s]: performing COLD password login", uhash)
     client = Garmin(email=username, password=password)
     client.login(tokenstore=user_token_dir)
     _client_cache[uhash] = client
+    logger.info("get_client[%s]: password login OK; token saved to %s", uhash, user_token_dir)
     return client
 
 
