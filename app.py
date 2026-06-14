@@ -39,6 +39,11 @@ def check_api_key():
     logger.info(
         "inbound %s %s reqId=%s", request.method, request.path, request.headers.get("X-Request-Id", "-")
     )
+    # /health is intentionally unauthenticated: it is the wake + readiness probe the proxy polls
+    # when Render has spun this free instance down. It touches no Garmin state and leaks nothing,
+    # so it stays outside the API-key gate (and is usable by an external keep-warm pinger too).
+    if request.path == "/health":
+        return
     if not INTERNAL_API_KEY:
         return
     provided = request.headers.get("X-API-Key")
@@ -56,6 +61,13 @@ def check_api_key():
             "code": "INVALID_API_KEY",
             "message": "Invalid X-API-Key — the key sent does not match the value configured on this service.",
         }), 401
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    # Cheap liveness signal. A 200 here means gunicorn is up and serving — which is exactly what
+    # the proxy needs to know before it sends the real /activities request after a cold start.
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/authenticate", methods=["POST"])
