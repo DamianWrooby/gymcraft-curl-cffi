@@ -32,10 +32,30 @@ CORS(
 
 @app.before_request
 def check_api_key():
+    # Inbound marker for every request that actually reaches Flask. Pair the reqId with the
+    # proxy's "[garmin-activities][#N] -> POST" line: if the proxy logs a 429 for #N but no
+    # "inbound ... reqId=N" line appears here, the request was throttled upstream (Render's
+    # Cloudflare edge) and never hit the app — i.e. NOT a Garmin rate limit.
+    logger.info(
+        "inbound %s %s reqId=%s", request.method, request.path, request.headers.get("X-Request-Id", "-")
+    )
     if not INTERNAL_API_KEY:
         return
-    if request.headers.get("X-API-Key") != INTERNAL_API_KEY:
-        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    provided = request.headers.get("X-API-Key")
+    if not provided:
+        logger.warning("Rejected %s %s: missing X-API-Key header", request.method, request.path)
+        return jsonify({
+            "status": "error",
+            "code": "MISSING_API_KEY",
+            "message": "Missing X-API-Key header — the internal API key was not sent by the caller.",
+        }), 401
+    if provided != INTERNAL_API_KEY:
+        logger.warning("Rejected %s %s: X-API-Key does not match configured key", request.method, request.path)
+        return jsonify({
+            "status": "error",
+            "code": "INVALID_API_KEY",
+            "message": "Invalid X-API-Key — the key sent does not match the value configured on this service.",
+        }), 401
 
 
 @app.route("/authenticate", methods=["POST"])
