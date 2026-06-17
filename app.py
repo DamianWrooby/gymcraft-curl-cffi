@@ -14,7 +14,10 @@ from garminconnect import GarminConnectTooManyRequestsError
 
 from garmin_service import get_activity_detail, get_client
 
-logging.basicConfig(level=logging.DEBUG)
+# INFO keeps our own operational logs (inbound, token cache hits/misses, cold logins, counts)
+# and garminconnect's WARNING-level login-strategy 429 summaries, while dropping the very chatty
+# urllib3 / garminconnect per-request DEBUG output. Flip to DEBUG when diagnosing a login issue.
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -134,6 +137,12 @@ def activities():
         # body does NOT match this JSON, the throttle came from an intermediary, not Garmin.
         logger.warning("activities: Garmin rate limit (429): %s", e)
         return jsonify({"status": "error", "message": f"Garmin rate limit: {e}"}), 429
+    except ValueError as e:
+        # Expected control-flow signal from get_client (no cached token + no password → the
+        # frontend prompts for credentials). Log cleanly at WARNING; a stack trace would be
+        # misleading noise for this normal cold-start path.
+        logger.warning("activities: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
     except Exception as e:
         logger.exception("activities failed (%s)", type(e).__name__)
         return jsonify({"status": "error", "message": str(e)}), 500
