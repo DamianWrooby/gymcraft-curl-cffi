@@ -12,7 +12,13 @@ from dotenv import load_dotenv
 
 from garminconnect import GarminConnectTooManyRequestsError
 
-from garmin_service import get_activity_detail, get_client
+import metrics
+from garmin_service import (
+    create_session,
+    get_activity_detail,
+    get_client_for_session,
+    revoke_session,
+)
 
 # INFO keeps our own operational logs (inbound, token cache hits/misses, cold logins, counts)
 # and garminconnect's WARNING-level login-strategy 429 summaries, while dropping the very chatty
@@ -73,6 +79,31 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/metrics", methods=["GET"])
+def metrics_view():
+    # Phase 0 diagnostics: counters (cache hit/miss, login paths, 429s) and per-operation latency
+    # percentiles. Per-process (per gunicorn worker) and resets on restart. Sits behind the
+    # X-API-Key gate via before_request, so it is not public when INTERNAL_API_KEY is configured.
+    return jsonify({"status": "ok", "metrics": metrics.snapshot()}), 200
+
+
+def _bearer_token():
+    """Extract the opaque session token from an 'Authorization: Bearer <token>' header."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[len("Bearer "):].strip()
+    return None
+
+
+def _client_from_bearer():
+    """Resolve the Bearer token to its Garmin client, or raise PermissionError.
+
+    The token is the SOLE identity signal — any username/password in the request
+    body is ignored, which is what closes the old email-keyed impersonation bypass.
+    """
+    return get_client_for_session(_bearer_token())
+
+
 @app.route("/authenticate", methods=["POST"])
 def authenticate():
     data = request.get_json(silent=True) or {}
@@ -83,25 +114,31 @@ def authenticate():
         return jsonify({"status": "error", "message": "Username and password are required"}), 400
 
     try:
-        get_client(username, password)
-        return jsonify({"status": "success", "message": "Authenticated successfully"})
+        session_token = create_session(username, password)
+        return jsonify({"status": "success", "session_token": session_token})
     except Exception as e:
         logger.exception("Authentication failed")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route("/logout", methods=["POST"])
+def logout():
+    # Idempotent: revoking a missing/unknown token is a no-op success.
+    revoke_session(_bearer_token())
+    return jsonify({"status": "success"})
+
+
 @app.route("/user-stats", methods=["POST"])
 def user_stats():
-    data = request.get_json(silent=True) or {}
-    username = data.get("username")
-    password = data.get("password")
-
-    if not username:
-        return jsonify({"status": "error", "message": "Username is required"}), 400
+    try:
+        client = _client_from_bearer()
+    except PermissionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 401
 
     try:
-        client = get_client(username, password)
-        stats = client.get_stats_and_body(date.today().isoformat())
+        with metrics.timer("user-stats.fetch") as t:
+            stats = client.get_stats_and_body(date.today().isoformat())
+        logger.info("user-stats: fetch in %.0f ms", t.elapsed_ms)
         return jsonify({"status": "success", "data": stats})
     except Exception as e:
         logger.exception("user-stats failed")
@@ -110,39 +147,33 @@ def user_stats():
 
 @app.route("/activities", methods=["POST"])
 def activities():
+    try:
+        client = _client_from_bearer()
+    except PermissionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 401
+
     data = request.get_json(silent=True) or {}
-    username = data.get("username")
-    password = data.get("password")
     start_date = data.get("startDate")
     end_date = data.get("endDate") or date.today().isoformat()
     activity_type = data.get("activityType")
 
-    if not username:
-        return jsonify({"status": "error", "message": "username is required"}), 400
     if not start_date:
         return jsonify({"status": "error", "message": "startDate is required"}), 400
 
-    logger.info(
-        "activities: %s..%s type=%s password_provided=%s", start_date, end_date, activity_type, bool(password)
-    )
+    logger.info("activities: %s..%s type=%s", start_date, end_date, activity_type)
     try:
-        client = get_client(username, password)
-        activities_data = client.get_activities_by_date(start_date, end_date, activity_type)
+        with metrics.timer("activities.fetch") as t:
+            activities_data = client.get_activities_by_date(start_date, end_date, activity_type)
         count = len(activities_data) if activities_data else 0
-        logger.info("activities: returned %d items", count)
+        logger.info("activities: returned %d items in %.0f ms", count, t.elapsed_ms)
         return jsonify({"status": "success", "data": activities_data})
     except GarminConnectTooManyRequestsError as e:
         # Surface rate limits as a real 429 (not a generic 500) so the proxy/app can tell
         # a Garmin throttle apart from other failures. If the proxy still logs a 429 whose
         # body does NOT match this JSON, the throttle came from an intermediary, not Garmin.
+        metrics.incr("garmin.429")
         logger.warning("activities: Garmin rate limit (429): %s", e)
         return jsonify({"status": "error", "message": f"Garmin rate limit: {e}"}), 429
-    except ValueError as e:
-        # Expected control-flow signal from get_client (no cached token + no password → the
-        # frontend prompts for credentials). Log cleanly at WARNING; a stack trace would be
-        # misleading noise for this normal cold-start path.
-        logger.warning("activities: %s", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
     except Exception as e:
         logger.exception("activities failed (%s)", type(e).__name__)
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -150,13 +181,13 @@ def activities():
 
 @app.route("/activity/detail", methods=["POST"])
 def activity_detail():
-    data = request.get_json(silent=True) or {}
-    username = data.get("username")
-    password = data.get("password")
-    activity_id = data.get("activityId")
+    try:
+        client = _client_from_bearer()
+    except PermissionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 401
 
-    if not username:
-        return jsonify({"status": "error", "message": "username is required"}), 400
+    data = request.get_json(silent=True) or {}
+    activity_id = data.get("activityId")
     if activity_id is None:
         return jsonify({"status": "error", "message": "activityId is required"}), 400
 
@@ -166,8 +197,9 @@ def activity_detail():
         return jsonify({"status": "error", "message": "activityId must be a number"}), 400
 
     try:
-        client = get_client(username, password)
-        detail = get_activity_detail(client, activity_id_int)
+        with metrics.timer("activity-detail.fetch") as t:
+            detail = get_activity_detail(client, activity_id_int)
+        logger.info("activity-detail: fetch in %.0f ms", t.elapsed_ms)
         return jsonify({"status": "success", "data": detail})
     except Exception as e:
         logger.exception("activity-detail failed")
@@ -176,31 +208,33 @@ def activity_detail():
 
 @app.route("/progress-summary", methods=["POST"])
 def progress_summary():
+    try:
+        client = _client_from_bearer()
+    except PermissionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 401
+
     data = request.get_json(silent=True) or {}
-    username = data.get("username")
-    password = data.get("password")
     start_date = data.get("startDate")
     end_date = data.get("endDate")
-    metric = data.get("metric") or "distance"
+    metric_name = data.get("metric") or "distance"
     group_by = data.get("groupByParentActivityType")
     if group_by is None:
         group_by = True
 
-    if not username:
-        return jsonify({"status": "error", "message": "username is required"}), 400
     if not start_date:
         return jsonify({"status": "error", "message": "startDate is required"}), 400
     if not end_date:
         return jsonify({"status": "error", "message": "endDate is required"}), 400
 
     try:
-        client = get_client(username, password)
-        summary = client.get_progress_summary_between_dates(
-            startdate=start_date,
-            enddate=end_date,
-            metric=metric,
-            groupbyactivities=bool(group_by),
-        )
+        with metrics.timer("progress-summary.fetch") as t:
+            summary = client.get_progress_summary_between_dates(
+                startdate=start_date,
+                enddate=end_date,
+                metric=metric_name,
+                groupbyactivities=bool(group_by),
+            )
+        logger.info("progress-summary: fetch in %.0f ms", t.elapsed_ms)
         return jsonify({"status": "success", "data": summary})
     except Exception as e:
         logger.exception("progress-summary failed")
@@ -209,8 +243,10 @@ def progress_summary():
 
 @app.route("/upload-workout", methods=["POST"])
 def upload_workout():
-    if "username" not in request.form:
-        return jsonify({"status": "error", "message": "Missing username"}), 400
+    try:
+        client = _client_from_bearer()
+    except PermissionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 401
 
     if "file" not in request.files:
         return jsonify({"status": "error", "message": "No file part in the request"}), 400
@@ -219,13 +255,11 @@ def upload_workout():
     if file.filename == "":
         return jsonify({"status": "error", "message": "No selected file"}), 400
 
-    username = request.form["username"]
-    password = request.form.get("password")
-
     try:
-        client = get_client(username, password)
         workout_json = json.loads(file.read().decode("utf-8"))
-        response = client.upload_workout(workout_json)
+        with metrics.timer("upload-workout.fetch") as t:
+            response = client.upload_workout(workout_json)
+        logger.info("upload-workout: upload in %.0f ms", t.elapsed_ms)
         return jsonify({"status": "success", "response": response})
     except json.JSONDecodeError as e:
         logger.error("JSON parse error: %s", e)
