@@ -13,9 +13,8 @@ Backend selection mirrors token_store:
 Expiry: sliding idle TTL, capped by an absolute lifetime. Lazy eviction on
 resolve(); `purge_expired()` is available for an optional sweep.
 
-The table lives in the `garmin` schema for the same reason as `token_store`: the
-DB is shared with GymCraft, and a table in `public` that Prisma does not model
-reads as schema drift.
+The table lives in the `garmin` schema rather than `public`; see `pg_store` for the
+reason and for the shared connection/bootstrap scaffolding.
 """
 
 import logging
@@ -25,6 +24,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Protocol
+
+from pg_store import PostgresStore, bootstrap_ddl
 
 logger = logging.getLogger(__name__)
 
@@ -104,21 +105,12 @@ class InMemorySessionStore:
         return len(dead)
 
 
-class PostgresSessionStore:
-    _DDL = """
-        CREATE SCHEMA IF NOT EXISTS garmin;
+class PostgresSessionStore(PostgresStore):
+    """See `pg_store.PostgresStore` for the connection and bootstrap model."""
 
-        -- One-time relocation out of `public`. SET SCHEMA carries the rows and the
-        -- index with the table, so live sessions stay valid. Guarded on both sides
-        -- so a redeploy is a no-op.
-        DO $$
-        BEGIN
-            IF to_regclass('public.garmin_sessions') IS NOT NULL
-               AND to_regclass('garmin.garmin_sessions') IS NULL THEN
-                ALTER TABLE public.garmin_sessions SET SCHEMA garmin;
-            END IF;
-        END $$;
+    _TABLE = "garmin.garmin_sessions"
 
+    _DDL = bootstrap_ddl("garmin_sessions") + """
         CREATE TABLE IF NOT EXISTS garmin.garmin_sessions (
             token      TEXT PRIMARY KEY,
             user_hash  TEXT NOT NULL,
@@ -129,29 +121,6 @@ class PostgresSessionStore:
         CREATE INDEX IF NOT EXISTS idx_garmin_sessions_expires
             ON garmin.garmin_sessions (expires_at);
     """
-
-    def __init__(self, dsn: str):
-        import psycopg2  # lazy: local dev needn't install the driver
-
-        self._psycopg2 = psycopg2
-        self._dsn = dsn
-        self._init_lock = threading.Lock()
-        self._initialized = False
-
-    def _connect(self):
-        return self._psycopg2.connect(self._dsn)
-
-    def _ensure_schema(self) -> None:
-        if self._initialized:
-            return
-        with self._init_lock:
-            if self._initialized:
-                return
-            with self._connect() as conn, conn.cursor() as cur:
-                cur.execute(self._DDL)
-                conn.commit()
-            self._initialized = True
-            logger.info("PostgresSessionStore: schema ensured (garmin.garmin_sessions)")
 
     def create(self, username: str, user_hash: str) -> str:
         self._ensure_schema()
@@ -221,7 +190,10 @@ def _build_default_store() -> SessionStore:
     if dsn:
         logger.info("sessions: using PostgresSessionStore (DATABASE_URL set)")
         return PostgresSessionStore(dsn)
-    logger.info("sessions: DATABASE_URL not set, using InMemorySessionStore (lost on restart)")
+    logger.warning(
+        "sessions: DATABASE_URL not set, falling back to InMemorySessionStore — "
+        "every session is lost on restart (expected in local dev only)"
+    )
     return InMemorySessionStore()
 
 
