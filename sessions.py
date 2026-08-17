@@ -12,6 +12,9 @@ Backend selection mirrors token_store:
 
 Expiry: sliding idle TTL, capped by an absolute lifetime. Lazy eviction on
 resolve(); `purge_expired()` is available for an optional sweep.
+
+The table lives in the `garmin` schema rather than `public`; see `pg_store` for the
+reason and for the shared connection/bootstrap scaffolding.
 """
 
 import logging
@@ -21,6 +24,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Protocol
+
+from pg_store import PostgresStore, bootstrap_ddl
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +105,13 @@ class InMemorySessionStore:
         return len(dead)
 
 
-class PostgresSessionStore:
-    _DDL = """
-        CREATE TABLE IF NOT EXISTS garmin_sessions (
+class PostgresSessionStore(PostgresStore):
+    """See `pg_store.PostgresStore` for the connection and bootstrap model."""
+
+    _TABLE = "garmin.garmin_sessions"
+
+    _DDL = bootstrap_ddl("garmin_sessions") + """
+        CREATE TABLE IF NOT EXISTS garmin.garmin_sessions (
             token      TEXT PRIMARY KEY,
             user_hash  TEXT NOT NULL,
             username   TEXT NOT NULL,
@@ -110,31 +119,8 @@ class PostgresSessionStore:
             expires_at DOUBLE PRECISION NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_garmin_sessions_expires
-            ON garmin_sessions (expires_at);
+            ON garmin.garmin_sessions (expires_at);
     """
-
-    def __init__(self, dsn: str):
-        import psycopg2  # lazy: local dev needn't install the driver
-
-        self._psycopg2 = psycopg2
-        self._dsn = dsn
-        self._init_lock = threading.Lock()
-        self._initialized = False
-
-    def _connect(self):
-        return self._psycopg2.connect(self._dsn)
-
-    def _ensure_schema(self) -> None:
-        if self._initialized:
-            return
-        with self._init_lock:
-            if self._initialized:
-                return
-            with self._connect() as conn, conn.cursor() as cur:
-                cur.execute(self._DDL)
-                conn.commit()
-            self._initialized = True
-            logger.info("PostgresSessionStore: schema ensured (garmin_sessions)")
 
     def create(self, username: str, user_hash: str) -> str:
         self._ensure_schema()
@@ -143,7 +129,7 @@ class PostgresSessionStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO garmin_sessions (token, user_hash, username, created_at, expires_at)
+                INSERT INTO garmin.garmin_sessions (token, user_hash, username, created_at, expires_at)
                 VALUES (%s, %s, %s, %s, %s)
                 """,
                 (token, user_hash, username, now, now + SESSION_TTL_SECONDS),
@@ -157,7 +143,7 @@ class PostgresSessionStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT token, user_hash, username, created_at, expires_at "
-                "FROM garmin_sessions WHERE token = %s",
+                "FROM garmin.garmin_sessions WHERE token = %s",
                 (token,),
             )
             row = cur.fetchone()
@@ -166,13 +152,13 @@ class PostgresSessionStore:
             s = Session(*row)
             new_deadline = _validate_and_slide(s, now)
             if new_deadline is None:
-                cur.execute("DELETE FROM garmin_sessions WHERE token = %s", (token,))
+                cur.execute("DELETE FROM garmin.garmin_sessions WHERE token = %s", (token,))
                 conn.commit()
                 return None
             # Throttle write amplification: only persist a meaningful slide.
             if new_deadline - s.expires_at >= _SLIDE_WRITE_THRESHOLD_SECONDS:
                 cur.execute(
-                    "UPDATE garmin_sessions SET expires_at = %s WHERE token = %s",
+                    "UPDATE garmin.garmin_sessions SET expires_at = %s WHERE token = %s",
                     (new_deadline, token),
                 )
                 conn.commit()
@@ -182,7 +168,7 @@ class PostgresSessionStore:
     def revoke(self, token: str) -> None:
         self._ensure_schema()
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM garmin_sessions WHERE token = %s", (token,))
+            cur.execute("DELETE FROM garmin.garmin_sessions WHERE token = %s", (token,))
             conn.commit()
 
     def purge_expired(self) -> int:
@@ -190,7 +176,7 @@ class PostgresSessionStore:
         now = time.time()
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM garmin_sessions "
+                "DELETE FROM garmin.garmin_sessions "
                 "WHERE expires_at < %s OR created_at < %s",
                 (now, now - SESSION_MAX_LIFETIME_SECONDS),
             )
@@ -204,7 +190,10 @@ def _build_default_store() -> SessionStore:
     if dsn:
         logger.info("sessions: using PostgresSessionStore (DATABASE_URL set)")
         return PostgresSessionStore(dsn)
-    logger.info("sessions: DATABASE_URL not set, using InMemorySessionStore (lost on restart)")
+    logger.warning(
+        "sessions: DATABASE_URL not set, falling back to InMemorySessionStore — "
+        "every session is lost on restart (expected in local dev only)"
+    )
     return InMemorySessionStore()
 
 

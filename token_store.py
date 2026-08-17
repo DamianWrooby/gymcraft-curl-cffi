@@ -12,15 +12,20 @@ Backend selection:
                           same on-disk layout garminconnect itself uses).
 
 The blob is an account credential (a JWT to the user's Garmin account). Treat the
-`garmin_tokens` table as secrets: restrict access and prefer DB-level encryption
-at rest. App-level encryption can be layered here later without touching callers.
+`garmin.garmin_tokens` table as secrets: restrict access and prefer DB-level
+encryption at rest. App-level encryption can be layered here later without
+touching callers.
+
+The table lives in the `garmin` schema rather than `public`; see `pg_store` for the
+reason and for the shared connection/bootstrap scaffolding.
 """
 
 import logging
 import os
-import threading
 from pathlib import Path
 from typing import Protocol
+
+from pg_store import PostgresStore, bootstrap_ddl
 
 logger = logging.getLogger(__name__)
 
@@ -59,48 +64,24 @@ class DiskTokenStore:
             p.unlink(missing_ok=True)
 
 
-class PostgresTokenStore:
-    """Postgres-backed store. Connect-per-operation: token ops only happen on a cache
-    miss (rare after warmup), so a fresh connection each time is simpler and more
-    resilient to managed-PG idle drops than a long-lived pool — and inherently safe
-    across the gthread worker's threads."""
+class PostgresTokenStore(PostgresStore):
+    """Postgres-backed store; see `pg_store.PostgresStore` for the connection model."""
 
-    _DDL = """
-        CREATE TABLE IF NOT EXISTS garmin_tokens (
+    _TABLE = "garmin.garmin_tokens"
+
+    _DDL = bootstrap_ddl("garmin_tokens") + """
+        CREATE TABLE IF NOT EXISTS garmin.garmin_tokens (
             user_hash  TEXT PRIMARY KEY,
             token_blob TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
+        );
     """
-
-    def __init__(self, dsn: str):
-        import psycopg2  # imported lazily so local dev needn't install the driver
-
-        self._psycopg2 = psycopg2
-        self._dsn = dsn
-        self._init_lock = threading.Lock()
-        self._initialized = False
-
-    def _connect(self):
-        return self._psycopg2.connect(self._dsn)
-
-    def _ensure_schema(self) -> None:
-        if self._initialized:
-            return
-        with self._init_lock:
-            if self._initialized:
-                return
-            with self._connect() as conn, conn.cursor() as cur:
-                cur.execute(self._DDL)
-                conn.commit()
-            self._initialized = True
-            logger.info("PostgresTokenStore: schema ensured (garmin_tokens)")
 
     def get(self, user_hash: str) -> str | None:
         self._ensure_schema()
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT token_blob FROM garmin_tokens WHERE user_hash = %s", (user_hash,)
+                "SELECT token_blob FROM garmin.garmin_tokens WHERE user_hash = %s", (user_hash,)
             )
             row = cur.fetchone()
         return row[0] if row else None
@@ -110,7 +91,7 @@ class PostgresTokenStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO garmin_tokens (user_hash, token_blob, updated_at)
+                INSERT INTO garmin.garmin_tokens (user_hash, token_blob, updated_at)
                 VALUES (%s, %s, now())
                 ON CONFLICT (user_hash)
                 DO UPDATE SET token_blob = EXCLUDED.token_blob, updated_at = now()
@@ -122,7 +103,7 @@ class PostgresTokenStore:
     def delete(self, user_hash: str) -> None:
         self._ensure_schema()
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM garmin_tokens WHERE user_hash = %s", (user_hash,))
+            cur.execute("DELETE FROM garmin.garmin_tokens WHERE user_hash = %s", (user_hash,))
             conn.commit()
 
 
@@ -132,7 +113,11 @@ def _build_default_store() -> TokenStore:
         logger.info("token_store: using PostgresTokenStore (DATABASE_URL set)")
         return PostgresTokenStore(dsn)
     base = Path(os.getenv("GARMIN_TOKEN_DIR", "~/.garmin_tokens")).expanduser()
-    logger.info("token_store: DATABASE_URL not set, using DiskTokenStore at %s", base)
+    logger.warning(
+        "token_store: DATABASE_URL not set, falling back to DiskTokenStore at %s — "
+        "tokens will NOT survive a restart on ephemeral hosts (expected in local dev only)",
+        base,
+    )
     return DiskTokenStore(base)
 
 
