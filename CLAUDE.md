@@ -41,9 +41,9 @@ web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-clas
   - `get_client(username, password=None)`: fast cache check → on miss, under the per-user lock, `_login_locked` loads the token blob from `token_store` and resumes via `Garmin(email).login(tokenstore=<blob_string>)`; falls back to a password cascade if there's no blob; persists via `_persist_tokens` (`client.client.dumps()`).
   - `create_session(username, password)` → authenticates, then `sessions.store.create(...)` → token. `get_client_for_session(token)` → resolves the session, rebuilds the client by hash (no password), raises `PermissionError` if unusable. `revoke_session(token)`.
 
-- **`token_store.py`** — persistent Garmin token blobs. `PostgresTokenStore` (table `garmin_tokens`) when `DATABASE_URL` is set, else `DiskTokenStore` (local dev). Stores the `{di_token, di_refresh_token, di_client_id}` JSON string from `client.dumps()`.
+- **`token_store.py`** — persistent Garmin token blobs. `PostgresTokenStore` (table `garmin.garmin_tokens`) when `DATABASE_URL` is set, else `DiskTokenStore` (local dev). Stores the `{di_token, di_refresh_token, di_client_id}` JSON string from `client.dumps()`.
 
-- **`sessions.py`** — opaque session tokens. `PostgresSessionStore` (table `garmin_sessions`) when `DATABASE_URL` is set, else `InMemorySessionStore`. Sliding idle TTL (`SESSION_TTL_SECONDS`, default 12h) capped by absolute lifetime (`SESSION_MAX_LIFETIME_SECONDS`, default 7d).
+- **`sessions.py`** — opaque session tokens. `PostgresSessionStore` (table `garmin.garmin_sessions`) when `DATABASE_URL` is set, else `InMemorySessionStore`. Sliding idle TTL (`SESSION_TTL_SECONDS`, default 12h) capped by absolute lifetime (`SESSION_MAX_LIFETIME_SECONDS`, default 7d).
 
 - **`metrics.py`** — in-process counters + timing percentiles, surfaced at `GET /metrics`.
 
@@ -53,7 +53,8 @@ web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-clas
 - **String vs path tokenstore**: `Garmin.login(tokenstore=...)` treats the arg as a raw JSON blob when `len > 512`, else a path. Token blobs (JWT `di_token`) exceed 512, so the DB-string path loads in-memory with no disk. Note: a string-loaded client does not auto-persist mid-session refreshes (no tokenstore path set) — we persist right after login (which proactively refreshes).
 - **`display_name`**: populated by `garminconnect`, which fetches `/userprofile-service/socialProfile` after login.
 - **`upload_workout()`** in `garminconnect` already returns a parsed `dict`. No response unwrapping needed.
-- **Persistence on Render**: tokens and sessions live in Postgres (the shared GymCraft DB), so they survive deploys/spin-down — the in-memory client cache is just a per-process accelerator rebuilt from the DB on demand.
+- **Persistence on Render**: tokens and sessions live in Postgres (the shared GymCraft DB), so they survive deploys/spin-down — the in-memory client cache is just a per-process accelerator rebuilt from the DB on demand. `DATABASE_URL` must be set on the Render service; without it both stores silently fall back to their dev backends (ephemeral disk + in-memory), which Render's 15-minute idle spin-down then wipes on every visit.
+- **`garmin` schema**: both tables live in a dedicated `garmin` schema, never `public`. The DB is shared with GymCraft, whose Prisma schema owns `public`; an unmodelled table there reads as drift and `prisma migrate dev` offers to reset the database. Prisma only introspects `public`, so the separate schema is what keeps these tables out of its reach. Use the **direct** (unpooled) DSN with no query parameters — libpq rejects Prisma-only ones such as `pgbouncer` and `connection_limit`.
 - **curl_cffi on Render**: the pip package bundles a compiled libcurl-impersonate — no system-level dependencies required.
 - **Do not set `GARMINTOKENS`** in the environment: garminconnect would pick it up as a default tokenstore and interfere with the password-login path.
 

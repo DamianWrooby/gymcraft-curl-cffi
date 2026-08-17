@@ -12,8 +12,15 @@ Backend selection:
                           same on-disk layout garminconnect itself uses).
 
 The blob is an account credential (a JWT to the user's Garmin account). Treat the
-`garmin_tokens` table as secrets: restrict access and prefer DB-level encryption
-at rest. App-level encryption can be layered here later without touching callers.
+`garmin.garmin_tokens` table as secrets: restrict access and prefer DB-level
+encryption at rest. App-level encryption can be layered here later without
+touching callers.
+
+The table lives in the `garmin` schema, not `public`. The DB is shared with
+GymCraft, whose Prisma schema owns `public` — a table there that Prisma does not
+know about reads as schema drift, and `prisma migrate dev` offers to reset the
+database to resolve it. Prisma only introspects `public`, so a separate schema
+puts these tables structurally out of its reach.
 """
 
 import logging
@@ -66,11 +73,24 @@ class PostgresTokenStore:
     across the gthread worker's threads."""
 
     _DDL = """
-        CREATE TABLE IF NOT EXISTS garmin_tokens (
+        CREATE SCHEMA IF NOT EXISTS garmin;
+
+        -- One-time relocation out of `public`, where the table was originally created.
+        -- SET SCHEMA moves the rows with the table, so nobody has to sign in to Garmin
+        -- again. Guarded on both sides so a redeploy is a no-op.
+        DO $$
+        BEGIN
+            IF to_regclass('public.garmin_tokens') IS NOT NULL
+               AND to_regclass('garmin.garmin_tokens') IS NULL THEN
+                ALTER TABLE public.garmin_tokens SET SCHEMA garmin;
+            END IF;
+        END $$;
+
+        CREATE TABLE IF NOT EXISTS garmin.garmin_tokens (
             user_hash  TEXT PRIMARY KEY,
             token_blob TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
+        );
     """
 
     def __init__(self, dsn: str):
@@ -94,13 +114,13 @@ class PostgresTokenStore:
                 cur.execute(self._DDL)
                 conn.commit()
             self._initialized = True
-            logger.info("PostgresTokenStore: schema ensured (garmin_tokens)")
+            logger.info("PostgresTokenStore: schema ensured (garmin.garmin_tokens)")
 
     def get(self, user_hash: str) -> str | None:
         self._ensure_schema()
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT token_blob FROM garmin_tokens WHERE user_hash = %s", (user_hash,)
+                "SELECT token_blob FROM garmin.garmin_tokens WHERE user_hash = %s", (user_hash,)
             )
             row = cur.fetchone()
         return row[0] if row else None
@@ -110,7 +130,7 @@ class PostgresTokenStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO garmin_tokens (user_hash, token_blob, updated_at)
+                INSERT INTO garmin.garmin_tokens (user_hash, token_blob, updated_at)
                 VALUES (%s, %s, now())
                 ON CONFLICT (user_hash)
                 DO UPDATE SET token_blob = EXCLUDED.token_blob, updated_at = now()
@@ -122,7 +142,7 @@ class PostgresTokenStore:
     def delete(self, user_hash: str) -> None:
         self._ensure_schema()
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM garmin_tokens WHERE user_hash = %s", (user_hash,))
+            cur.execute("DELETE FROM garmin.garmin_tokens WHERE user_hash = %s", (user_hash,))
             conn.commit()
 
 
