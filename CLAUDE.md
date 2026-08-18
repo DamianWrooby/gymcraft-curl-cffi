@@ -27,6 +27,7 @@ web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-clas
 
 - **`app.py`** — Flask routes (thin layer, delegates to `garmin_service`). Auth model is **opaque session tokens** (Bearer), not credentials-per-call:
   - `POST /authenticate` — JSON `{username, password}` → `{status, session_token}`. Runs a real Garmin login, then issues a token.
+  - `POST /session/refresh` — JSON `{username}` → `{status, session_token}`. Mints a session from the persisted token blob, **no password**. Identity is the email, which is safe *only* because the `X-API-Key` gate limits callers to trusted servers and those servers read the email from the authenticated user's own record, never from the browser. **Never expose this through the AI proxy.** `401 REAUTH_REQUIRED` is the sole answer that should trigger a password prompt.
   - `POST /logout` — `Authorization: Bearer <token>` → revokes the session (idempotent).
   - `POST /user-stats` — Bearer → `{status, data}` (`client.get_stats_and_body(today)`).
   - `POST /activities`, `POST /activity/detail`, `POST /progress-summary` — Bearer + JSON params.
@@ -34,6 +35,7 @@ web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-clas
   - `GET /health` — unauthenticated liveness probe. `GET /metrics` — diagnostic counters/latency (behind the API-key gate).
   - **The Bearer token is the sole identity** — any `username`/`password` in the body is ignored. This closes the old email-keyed impersonation bypass. Protected routes check auth *before* param validation and return 401 on a missing/invalid/expired token.
   - Two auth layers: service-level `X-API-Key` (`before_request`, for the proxy) **and** user-level Bearer session token.
+  - **Three failure outcomes, never two.** `401` = this session is unusable, so the caller should try `/session/refresh` first. `401 REAUTH_REQUIRED` (refresh only) = the stored authorization is dead; ask for the password. `429 RATE_LIMITED` = credentials are fine, Garmin is throttling; back off and **never** prompt. Routes re-raise `GarminConnectTooManyRequestsError` and a single `@app.errorhandler` maps it, so no route can accidentally flatten a throttle into a 500 or a 401. `get_client_for_session` deliberately lets it through for the same reason: flattening it made the app prompt for a password, whose cold login is the most rate-limited path there is.
   - CORS: `localhost:5173` and `gymcraft.damianwroblewski.com`
 
 - **`garmin_service.py`** — Garmin client management, caching, session orchestration:

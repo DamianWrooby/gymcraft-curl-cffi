@@ -17,6 +17,7 @@ from garmin_service import (
     create_session,
     get_activity_detail,
     get_client_for_session,
+    renew_session,
     revoke_session,
 )
 
@@ -72,6 +73,23 @@ def check_api_key():
         }), 401
 
 
+@app.errorhandler(GarminConnectTooManyRequestsError)
+def handle_garmin_rate_limit(e):
+    """One place that turns a Garmin throttle into a 429 with a distinct code.
+
+    RATE_LIMITED must stay separable from the 401s: the caller has to know that the
+    credentials are fine and Garmin is busy, so it backs off instead of prompting for
+    a password. Routes re-raise this rather than mapping it themselves.
+    """
+    metrics.incr("garmin.429")
+    logger.warning("Garmin rate limit (429) on %s: %s", request.path, e)
+    return jsonify({
+        "status": "error",
+        "code": "RATE_LIMITED",
+        "message": f"Garmin rate limit: {e}",
+    }), 429
+
+
 @app.route("/health", methods=["GET"])
 def health():
     # Cheap liveness signal. A 200 here means gunicorn is up and serving — which is exactly what
@@ -116,8 +134,40 @@ def authenticate():
     try:
         session_token = create_session(username, password)
         return jsonify({"status": "success", "session_token": session_token})
+    except GarminConnectTooManyRequestsError:
+        raise  # mapped centrally by handle_garmin_rate_limit
     except Exception as e:
         logger.exception("Authentication failed")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/session/refresh", methods=["POST"])
+def session_refresh():
+    """Mint a new session token from the stored Garmin authorization — no password.
+
+    Identity here is the email, which would be the old impersonation bypass if it came
+    from the browser. It does not: the X-API-Key gate in before_request means only a
+    trusted server can call this, and that server reads the email from the
+    authenticated user's own record rather than from the request it received. This
+    route must never be exposed through the browser-facing AI proxy.
+
+    401 REAUTH_REQUIRED is the only answer that should put a password prompt in front
+    of the athlete.
+    """
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    if not username:
+        return jsonify({"status": "error", "message": "username is required"}), 400
+
+    try:
+        session_token = renew_session(username)
+        return jsonify({"status": "success", "session_token": session_token})
+    except PermissionError as e:
+        return jsonify({"status": "error", "code": "REAUTH_REQUIRED", "message": str(e)}), 401
+    except GarminConnectTooManyRequestsError:
+        raise  # mapped centrally by handle_garmin_rate_limit
+    except Exception as e:
+        logger.exception("session refresh failed")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -140,6 +190,8 @@ def user_stats():
             stats = client.get_stats_and_body(date.today().isoformat())
         logger.info("user-stats: fetch in %.0f ms", t.elapsed_ms)
         return jsonify({"status": "success", "data": stats})
+    except GarminConnectTooManyRequestsError:
+        raise  # mapped centrally by handle_garmin_rate_limit
     except Exception as e:
         logger.exception("user-stats failed")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -167,13 +219,11 @@ def activities():
         count = len(activities_data) if activities_data else 0
         logger.info("activities: returned %d items in %.0f ms", count, t.elapsed_ms)
         return jsonify({"status": "success", "data": activities_data})
-    except GarminConnectTooManyRequestsError as e:
-        # Surface rate limits as a real 429 (not a generic 500) so the proxy/app can tell
-        # a Garmin throttle apart from other failures. If the proxy still logs a 429 whose
-        # body does NOT match this JSON, the throttle came from an intermediary, not Garmin.
-        metrics.incr("garmin.429")
-        logger.warning("activities: Garmin rate limit (429): %s", e)
-        return jsonify({"status": "error", "message": f"Garmin rate limit: {e}"}), 429
+    except GarminConnectTooManyRequestsError:
+        # Mapped centrally by handle_garmin_rate_limit, which tags it RATE_LIMITED. If the
+        # proxy logs a 429 whose body does NOT carry that code, the throttle came from an
+        # intermediary (Render's edge), not from Garmin.
+        raise
     except Exception as e:
         logger.exception("activities failed (%s)", type(e).__name__)
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -201,6 +251,8 @@ def activity_detail():
             detail = get_activity_detail(client, activity_id_int)
         logger.info("activity-detail: fetch in %.0f ms", t.elapsed_ms)
         return jsonify({"status": "success", "data": detail})
+    except GarminConnectTooManyRequestsError:
+        raise  # mapped centrally by handle_garmin_rate_limit
     except Exception as e:
         logger.exception("activity-detail failed")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -236,6 +288,8 @@ def progress_summary():
             )
         logger.info("progress-summary: fetch in %.0f ms", t.elapsed_ms)
         return jsonify({"status": "success", "data": summary})
+    except GarminConnectTooManyRequestsError:
+        raise  # mapped centrally by handle_garmin_rate_limit
     except Exception as e:
         logger.exception("progress-summary failed")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -264,6 +318,8 @@ def upload_workout():
     except json.JSONDecodeError as e:
         logger.error("JSON parse error: %s", e)
         return jsonify({"status": "error", "message": f"Invalid JSON format: {e}"}), 400
+    except GarminConnectTooManyRequestsError:
+        raise  # mapped centrally by handle_garmin_rate_limit
     except Exception as e:
         logger.exception("upload-workout failed")
         return jsonify({"status": "error", "message": str(e)}), 500

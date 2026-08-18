@@ -151,11 +151,49 @@ def create_session(username: str, password: str) -> str:
     return token
 
 
+def renew_session(username: str) -> str:
+    """Issue a fresh session token from the persisted Garmin tokens, with no password.
+
+    This is what makes an expired session invisible to the athlete: the Garmin
+    authorization in token_store outlives any single session, so a new session can
+    be minted from it. Only the caller's service-level API key authorizes this —
+    `username` is not a claim from the browser, it is read server-side from the
+    authenticated user's own record.
+
+    Raises GarminConnectTooManyRequestsError when Garmin is throttling; the caller
+    must NOT read that as a credential failure. Raises PermissionError only when the
+    stored authorization is genuinely unusable, which is the one case that needs the
+    athlete's password again.
+    """
+    if not username:
+        raise ValueError("username is required")
+    uhash = _user_hash(username)
+    try:
+        get_client(username)  # no password: token blob only
+    except GarminConnectTooManyRequestsError:
+        metrics.incr("session.renew_rate_limited")
+        logger.warning("renew_session[%s]: Garmin rate limit; not a credential failure", uhash)
+        raise
+    except Exception as e:
+        metrics.incr("session.renew_reauth_required")
+        logger.info("renew_session[%s]: stored tokens unusable (%s): %s", uhash, type(e).__name__, e)
+        raise PermissionError("stored Garmin authorization is no longer usable") from e
+    token = sessions.store.create(username, uhash)
+    metrics.incr("session.renewed")
+    logger.info("renew_session[%s]: issued a fresh session without a password", uhash)
+    return token
+
+
 def get_client_for_session(token: str) -> Garmin:
     """Resolve a Bearer token to its authenticated Garmin client.
 
     Raises PermissionError if the token is missing/invalid/expired, or if the
     user's persisted Garmin tokens can no longer restore a client.
+
+    Lets GarminConnectTooManyRequestsError through untouched. A throttle is not a
+    credential failure, and flattening it into PermissionError made the app show a
+    password prompt — whose cold login is the single most rate-limited path there
+    is, so the user's "fix" made the throttle worse.
     """
     if not token:
         metrics.incr("session.missing")
@@ -169,6 +207,10 @@ def get_client_for_session(token: str) -> Garmin:
         client = get_client(session.username)
         metrics.incr("session.resolved")
         return client
+    except GarminConnectTooManyRequestsError:
+        metrics.incr("session.rate_limited")
+        logger.warning("get_client_for_session: Garmin rate limit during restore for %s", session.user_hash)
+        raise
     except Exception as e:
         metrics.incr("session.unrestorable")
         logger.warning(
