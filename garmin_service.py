@@ -247,7 +247,8 @@ _MAX_DETAIL_SAMPLES = 1000
 def get_activity_detail(client: Garmin, activity_id):
     """
     Fetch a single activity's detailed payload — overall summary, per-lap splits,
-    and a downsampled HR/speed/elevation time-series suitable for charting and AI analysis.
+    a downsampled HR/speed/elevation/cadence/power time-series suitable for charting
+    and AI analysis, a downsampled GPS route, and a running-dynamics summary.
 
     Response shape: see gym-craft/.ai/PYTHON_ACTIVITY_DETAIL_SPEC.md.
     """
@@ -287,6 +288,8 @@ def get_activity_detail(client: Garmin, activity_id):
         "distance": summary.get("distance"),
         "splits": _build_splits(splits_raw),
         "samples": _build_samples(detail_metrics, name_to_index),
+        "route": _build_route(detail_metrics, name_to_index),
+        "dynamics": _build_dynamics(summary),
     }
 
 
@@ -323,6 +326,10 @@ def _build_samples(detail_metrics, name_to_index):
     hr_idx = name_to_index.get("directHeartRate")
     speed_idx = name_to_index.get("directSpeed")
     elev_idx = name_to_index.get("directElevation")
+    cadence_idx = name_to_index.get("directDoubleCadence")
+    if cadence_idx is None:
+        cadence_idx = name_to_index.get("directRunCadence")
+    power_idx = name_to_index.get("directPower")
 
     samples = []
     for i in range(0, total, step):
@@ -336,9 +343,68 @@ def _build_samples(detail_metrics, name_to_index):
                 "heartRate": _row_number(row, hr_idx),
                 "speed": _row_number(row, speed_idx),
                 "elevationM": _row_number(row, elev_idx),
+                "cadence": _row_number(row, cadence_idx),
+                "power": _row_number(row, power_idx),
             }
         )
     return samples
+
+
+_MAX_ROUTE_POINTS = 300
+
+
+def _build_route(detail_metrics, name_to_index):
+    if not detail_metrics:
+        return []
+
+    lat_idx = name_to_index.get("directLatitude")
+    lng_idx = name_to_index.get("directLongitude")
+    if lat_idx is None or lng_idx is None:
+        return []
+
+    points = []
+    for entry in detail_metrics:
+        row = entry.get("metrics") if isinstance(entry, dict) else None
+        if not isinstance(row, list):
+            continue
+        lat = _row_number(row, lat_idx)
+        lng = _row_number(row, lng_idx)
+        if lat is not None and lng is not None:
+            points.append({"lat": lat, "lng": lng})
+
+    if not points:
+        return []
+
+    # Same stride-downsampling approach as _build_samples, capped lower since a
+    # route is drawn on a map rather than charted, so it needs far fewer points.
+    total = len(points)
+    step = max(1, total // _MAX_ROUTE_POINTS)
+    return points[::step]
+
+
+def _build_dynamics(summary):
+    if not isinstance(summary, dict):
+        return None
+
+    avg_run_cadence = _coerce_number(summary.get("averageRunCadence"))
+    avg_bike_cadence = _coerce_number(summary.get("averageBikeCadence"))
+    max_run_cadence = _coerce_number(summary.get("maxRunCadence"))
+    max_bike_cadence = _coerce_number(summary.get("maxBikeCadence"))
+
+    dynamics = {
+        "avgCadence": avg_run_cadence if avg_run_cadence is not None else avg_bike_cadence,
+        "maxCadence": max_run_cadence if max_run_cadence is not None else max_bike_cadence,
+        "avgGroundContactTimeMs": _coerce_number(summary.get("avgGroundContactTime")),
+        "avgVerticalOscillationCm": _coerce_number(summary.get("avgVerticalOscillation")),
+        "avgVerticalRatioPct": _coerce_number(summary.get("avgVerticalRatio")),
+        "avgPowerW": _coerce_number(summary.get("avgPower")),
+        "maxPowerW": _coerce_number(summary.get("maxPower")),
+        "minTemperatureC": _coerce_number(summary.get("minTemperature")),
+        "maxTemperatureC": _coerce_number(summary.get("maxTemperature")),
+    }
+    if all(v is None for v in dynamics.values()):
+        return None
+    return dynamics
 
 
 def _row_number(row, index, default=None):
