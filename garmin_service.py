@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import secrets
 import threading
 import time
 
@@ -28,6 +29,26 @@ _client_cache: dict[str, Garmin] = {}
 _cache_lock = threading.Lock()
 _user_locks: dict[str, threading.Lock] = {}
 _user_locks_guard = threading.Lock()
+
+# Logins paused at Garmin's MFA step, keyed by an opaque ticket. The pending state is a live
+# curl_cffi session with SSO cookies on the Garmin object (`resume_login` ignores its state
+# argument), so it cannot go to Postgres. This is safe ONLY because the Procfile runs a single
+# gunicorn worker: with more workers, the code step could land on a process without the ticket.
+MFA_TICKET_TTL_SECONDS = 600
+_pending_mfa: dict[str, tuple[str, Garmin, float]] = {}
+_pending_mfa_lock = threading.Lock()
+
+
+class MfaRequired(Exception):
+    """Garmin asked for an emailed code; finish with `complete_mfa_session(ticket, code)`."""
+
+    def __init__(self, ticket: str):
+        super().__init__("Garmin requires an MFA code")
+        self.ticket = ticket
+
+
+class MfaTicketExpired(Exception):
+    """The ticket is unknown or older than MFA_TICKET_TTL_SECONDS; the user must log in again."""
 
 
 def _user_hash(username: str) -> str:
@@ -119,12 +140,16 @@ def _login_locked(username: str, password: str | None, uhash: str) -> Garmin:
     logger.warning("get_client[%s]: performing COLD password login", uhash)
     start = time.perf_counter()
     try:
-        client = Garmin(email=username, password=password)
-        client.login()  # no tokenstore -> full SSO cascade
+        client = Garmin(email=username, password=password, return_on_mfa=True)
+        mfa_status, _ = client.login()  # no tokenstore -> full SSO cascade
     except GarminConnectTooManyRequestsError:
         metrics.incr("garmin.429")
         metrics.incr("get_client.password_login_429")
         raise
+    if mfa_status == "needs_mfa":
+        metrics.incr("get_client.mfa_required")
+        logger.info("get_client[%s]: Garmin requires MFA; parking the login", uhash)
+        raise MfaRequired(_park_mfa_login(username, client))
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     metrics.record_timing("get_client.cold_password_login", elapsed_ms)
     metrics.incr("get_client.password_login_ok")
@@ -133,6 +158,48 @@ def _login_locked(username: str, password: str | None, uhash: str) -> Garmin:
         _client_cache[uhash] = client
     logger.info("get_client[%s]: password login OK in %.0f ms; tokens persisted", uhash, elapsed_ms)
     return client
+
+
+def _park_mfa_login(username: str, client: Garmin) -> str:
+    ticket = secrets.token_urlsafe(32)
+    now = time.time()
+    with _pending_mfa_lock:
+        # Sweep on write: the dict stays small without a background thread.
+        for stale in [t for t, (_, _, at) in _pending_mfa.items() if now - at > MFA_TICKET_TTL_SECONDS]:
+            del _pending_mfa[stale]
+        _pending_mfa[ticket] = (username, client, now)
+    return ticket
+
+
+def complete_mfa_session(ticket: str, code: str) -> str:
+    """Finish a login parked at the MFA step, then issue a session token like `create_session`.
+
+    A wrong code raises GarminConnectAuthenticationError and keeps the ticket, so the user
+    can retry. An unknown or expired ticket raises MfaTicketExpired.
+    """
+    if not ticket or not code:
+        raise ValueError("mfa_ticket and code are required")
+    with _pending_mfa_lock:
+        entry = _pending_mfa.get(ticket)
+        if entry is not None and time.time() - entry[2] > MFA_TICKET_TTL_SECONDS:
+            del _pending_mfa[ticket]
+            entry = None
+    if entry is None:
+        metrics.incr("session.mfa_ticket_expired")
+        raise MfaTicketExpired("MFA ticket is unknown or expired")
+
+    username, client, _ = entry
+    uhash = _user_hash(username)
+    client.resume_login(None, code.strip())
+    with _pending_mfa_lock:
+        _pending_mfa.pop(ticket, None)
+    _persist_tokens(uhash, client)
+    with _cache_lock:
+        _client_cache[uhash] = client
+    token = sessions.store.create(username, uhash)
+    metrics.incr("session.created_after_mfa")
+    logger.info("complete_mfa_session: issued token for %s", uhash)
+    return token
 
 
 def create_session(username: str, password: str) -> str:

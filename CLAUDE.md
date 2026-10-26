@@ -27,6 +27,7 @@ web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-clas
 
 - **`app.py`** — Flask routes (thin layer, delegates to `garmin_service`). Auth model is **opaque session tokens** (Bearer), not credentials-per-call:
   - `POST /authenticate` — JSON `{username, password}` → `{status, session_token}`. Runs a real Garmin login, then issues a token.
+  - Email MFA: when Garmin asks for a code, `/authenticate` returns `200 {status: "mfa_required", code: "MFA_REQUIRED", mfa_ticket}`. `POST /authenticate/mfa` — JSON `{mfa_ticket, code}` → `{status, session_token}`; `401 MFA_INVALID_CODE` keeps the ticket for a retry, `401 MFA_EXPIRED` means start again with the password. Parked logins live in process memory (`_pending_mfa`, 10-min TTL) because the pending state is a live curl_cffi session — **this relies on `--workers 1`**.
   - `POST /session/refresh` — JSON `{username}` → `{status, session_token}`. Mints a session from the persisted token blob, **no password**. Identity is the email, which is safe *only* because the `X-API-Key` gate limits callers to trusted servers and those servers read the email from the authenticated user's own record, never from the browser. **Never expose this through the AI proxy.** `401 REAUTH_REQUIRED` is the sole answer that should trigger a password prompt.
   - `POST /logout` — `Authorization: Bearer <token>` → revokes the session (idempotent).
   - `POST /user-stats` — Bearer → `{status, data}` (`client.get_stats_and_body(today)`).
