@@ -10,10 +10,13 @@ from flask_cors import CORS
 
 from dotenv import load_dotenv
 
-from garminconnect import GarminConnectTooManyRequestsError
+from garminconnect import GarminConnectAuthenticationError, GarminConnectTooManyRequestsError
 
 import metrics
 from garmin_service import (
+    MfaRequired,
+    MfaTicketExpired,
+    complete_mfa_session,
     create_session,
     get_activity_detail,
     get_client_for_session,
@@ -134,10 +137,40 @@ def authenticate():
     try:
         session_token = create_session(username, password)
         return jsonify({"status": "success", "session_token": session_token})
+    except MfaRequired as e:
+        # Not an error: the login is parked until the user sends the emailed code.
+        return jsonify({"status": "mfa_required", "code": "MFA_REQUIRED", "mfa_ticket": e.ticket}), 200
     except GarminConnectTooManyRequestsError:
         raise  # mapped centrally by handle_garmin_rate_limit
     except Exception as e:
         logger.exception("Authentication failed")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/authenticate/mfa", methods=["POST"])
+def authenticate_mfa():
+    """Second login step: `{mfa_ticket, code}` -> `{status, session_token}`.
+
+    401 MFA_INVALID_CODE keeps the ticket, so the user can retry. 401 MFA_EXPIRED means
+    the parked login is gone and the user must start again with the password.
+    """
+    data = request.get_json(silent=True) or {}
+    ticket = data.get("mfa_ticket")
+    code = data.get("code")
+    if not ticket or not code:
+        return jsonify({"status": "error", "message": "mfa_ticket and code are required"}), 400
+
+    try:
+        session_token = complete_mfa_session(ticket, str(code))
+        return jsonify({"status": "success", "session_token": session_token})
+    except MfaTicketExpired as e:
+        return jsonify({"status": "error", "code": "MFA_EXPIRED", "message": str(e)}), 401
+    except GarminConnectAuthenticationError as e:
+        return jsonify({"status": "error", "code": "MFA_INVALID_CODE", "message": str(e)}), 401
+    except GarminConnectTooManyRequestsError:
+        raise  # mapped centrally by handle_garmin_rate_limit
+    except Exception as e:
+        logger.exception("MFA completion failed")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
